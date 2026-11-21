@@ -369,14 +369,32 @@ def rot(vx, vy, a):
 
 
 UPGRADE_PRIORITY = [
-    "armor", "plating", "gun_damage", "laser_damage", "lightning_chain", "gun_rate",
-    "gyros", "nanites", "mortar_reload", "laser_charge", "lightning_efficiency",
-    "lightning_range", "servos", "gun_mag", "capacitor", "jets", "reactor",
-    "gun_velocity", "mortar_splash", "mortar_velocity", "laser_pierce", "sensors",
+    "armor",              # +HP — directly extends survival
+    "plating",            # +damage reduction
+    "nanites",            # HP regen upgrade — reduces need to stand still healing
+    "gun_damage",         # gun is always equipped
+    "laser_damage",       # scales the primary kill tool
+    "lightning_chain",    # chain hits = more targets
+    "gun_rate",           # more shots
+    "gyros",              # faster aim slew — hits more shots
+    "laser_charge",       # faster charge = shorter exposure window
+    "mortar_reload",
+    "lightning_efficiency",
+    "lightning_range",
+    "servos",             # move speed
+    "gun_mag",
+    "capacitor",          # more energy for lightning / boosting
+    "jets",
+    "reactor",
+    "gun_velocity",
+    "mortar_splash",
+    "mortar_velocity",
+    "laser_pierce",
+    "sensors",
 ]
 
 # how much we like carrying each secondary weapon
-WEAPON_VALUE = {"lightning": 3.0, "laser": 2.7, "mortar": 1.5}
+WEAPON_VALUE = {"lightning": 3.0, "laser": 2.8, "mortar": 1.5}
 
 
 def pick_upgrade(choices):
@@ -429,7 +447,7 @@ class Planner:
 
 
 class Bot:
-    name = "TactBot2"
+    name = "TactBot3"
 
     def __init__(self, hello):
         cfg = hello["config"]
@@ -469,6 +487,16 @@ class Bot:
         self.mode = "init"
         self.laser_hold = 0
         self.take_cooldown = {}
+        self.last_rear_hit_t = -99.0
+        self.last_rear_hit_bearing = None
+        # --- telemetry ---
+        self._tlog_t = -99.0        # last status-line time
+        self._hp_hist = []           # (t, hp) rolling 6s for death summary
+        self._total_dmg_taken = 0.0
+        self._dmg_by_weapon = {}
+        self._kill_count = 0
+        self._hits_fired = 0
+        self._hits_landed = 0
 
     # ------------------------------------------------------------------ main
     def act(self, obs):
@@ -753,7 +781,9 @@ class Bot:
                 info = "laser"
                 self.laser_hold += 1
                 aligned = ey < ltol and ep < ltol * 1.5
-                if (charge >= 0.9 * full and aligned and clear) or charge >= full * 2.5 or not clear or dist > lrange:
+                # cap hold at 10 ticks (~1.0s) even if not aligned — avoids telegraphing too long
+                timed_out = self.laser_hold > 10
+                if (charge >= 0.9 * full and aligned and clear) or charge >= full * 2.5 or not clear or dist > lrange or timed_out:
                     fire[1] = False
                     self.laser_hold = 0
                 else:
@@ -797,13 +827,17 @@ class Bot:
         sec = me["weapons"][1]
         k = sec["kind"] if sec else None
         ew = tgt.get("weapons", []) or []
+        enemy_has_laser = "laser" in ew
         if k == "lightning":
-            return 70.0 if "mortar" in ew else 30.0
+            return 70.0 if "mortar" in ew else 35.0
         if k == "laser":
-            return 95.0 if "lightning" in ew else 80.0
+            return 130.0 if "lightning" in ew else 115.0
         if k == "mortar":
-            return 55.0
-        return 70.0 if "lightning" in ew else 60.0
+            return 100.0
+        # gun only: 115m baseline; pull to 160m against laser carriers
+        if enemy_has_laser:
+            return 160.0
+        return 90.0 if "lightning" in ew else 115.0
 
     # ------------------------------------------------------------------ loot
     def want_pickup(self, me, kind):
@@ -840,24 +874,35 @@ class Bot:
                 best_s = s
                 best = (kind, (pos[0], pos[1]), obj, stop)
 
+        no_sec = me["weapons"][1] is None
+        early_arm = t < 45 and no_sec
         for p in obs.get("pickups", []):
             if self.want_pickup(me, p["kind"]):
                 if abs(p["pos"][2] - z) < 3.5:  # skip rooftops we can't walk to
-                    consider("pickup", p["pos"], 120.0 * WEAPON_VALUE.get(p["kind"], 1) / 3.0 + 40, 170.0, p, 1.8)
+                    base_val = 120.0 * WEAPON_VALUE.get(p["kind"], 1) / 3.0 + 40
+                    if no_sec:
+                        base_val *= 2.0  # urgently want first secondary weapon
+                    if early_arm and p["kind"] in ("laser", "lightning"):
+                        base_val *= 3.0  # sprint for the best weapons at game start
+                    # extend search radius early-game to find weapons across the map
+                    maxd = 350.0 if early_arm else 200.0
+                    consider("pickup", p["pos"], base_val, maxd, p, 1.8)
         for c in obs.get("cubes", []):
             if abs(c["pos"][2] - z) < 3.5:
                 consider("cube", c["pos"], 100.0, 110.0, c, 0.8)
-        if hp_frac > 0.5:
+        if hp_frac > 0.4:
             for c in obs.get("crates", []):
                 if abs(c["pos"][2] - z) < 10.0:
                     c2 = dict(c)
                     c2["_crate"] = True
                     c2["vel"] = [0, 0, 0]
-                    consider("crate", c["pos"], 55.0, 70.0, c2, 28.0)
-            if hp_frac > 0.6:
+                    crate_base = 65.0 if t < 60 else 55.0  # more aggressive early farming
+                    consider("crate", c["pos"], crate_base, 90.0, c2, 28.0)
+            if hp_frac > 0.4:
                 for n in obs["mechs"]:
                     if n["kind"] == "npc":
-                        consider("npc", n["pos"], 40.0, 60.0, n, 30.0)
+                        npc_base = 70.0 if t < 60 else 40.0  # farm NPCs hard early
+                        consider("npc", n["pos"], npc_base, 90.0, n, 30.0)
         for dr in obs.get("drops", []):
             if dr["holder"] is not None and dr["holder"] != me["id"]:
                 continue
@@ -872,9 +917,13 @@ class Bot:
 
     # -------------------------------------------------------------- look dir
     def look_yaw(self, obs, me, t, move):
+        # Turn toward rear attacker first — rear hits do 1.5x damage
+        if t - self.last_rear_hit_t < 1.5 and self.last_rear_hit_bearing is not None:
+            return self.last_rear_hit_bearing
         if t - self.last_damage_t < 2.5 and self.last_damage_bearing is not None:
             return self.last_damage_bearing
-        if self.sound_dir is not None and t - self.sound_t < 1.5:
+        # extend sound window to 3s — good for pre-aiming before visual contact
+        if self.sound_dir is not None and t - self.sound_t < 3.0:
             return self.sound_dir
         base = me["aim"][0]
         if move is not None and (move[0] or move[1]):
@@ -899,6 +948,23 @@ class Bot:
             if ev.get("type") == "damaged" and ev.get("weapon") != "zone" and ev.get("bearing") is not None:
                 self.last_damage_t = t
                 self.last_damage_bearing = ev["bearing"]
+                if ev.get("rear"):
+                    self.last_rear_hit_t = t
+                    self.last_rear_hit_bearing = ev["bearing"]
+            # telemetry: track damage taken
+            if ev.get("type") == "damaged":
+                amt = ev.get("amount", 0)
+                wpn = ev.get("weapon", "?")
+                rear_flag = " REAR" if ev.get("rear") else ""
+                by_id = ev.get("by")
+                self._total_dmg_taken += amt
+                self._dmg_by_weapon[wpn] = self._dmg_by_weapon.get(wpn, 0) + amt
+                mf.log(f"DMG t={t:.1f} {wpn}{rear_flag} amt={amt:.0f} by={by_id} mode={self.mode} hp={hp:.0f}")
+            if ev.get("type") == "hit":
+                self._hits_landed += 1
+            if ev.get("type") == "kill":
+                self._kill_count += 1
+                mf.log(f"KILL t={t:.1f} target={ev.get('target')} kills={self._kill_count}")
         for s in obs.get("sounds", []):
             if s.get("kind") in ("gun", "mortar", "laser", "laser_charge", "lightning", "explosion", "step", "boost") \
                     and s.get("dist") in ("near", "mid"):
@@ -944,15 +1010,28 @@ class Bot:
         is_mech = False
         loot = None
         retreat = False
+        has_secondary = me["weapons"][1] is not None
         if mechs:
             target = self.pick_target(me, mechs)
             is_mech = True
             self.target_id = target["id"]
-            # retreat if badly hurt and losing the exchange
-            if hp_frac < 0.3 and nearest is not None:
-                ehp = nearest.get("hp", 1400)
-                if ehp > hp * 0.7:
+            # retreat if hurt or under recent fire with worse HP than enemy
+            taking_fire = (t - self.last_damage_t) < 2.5
+            crowd = sum(1 for m in mechs if math.hypot(m["pos"][0] - x, m["pos"][1] - y) < 100.0)
+            # Outgunned: enemy has secondary weapon, we don't — treat like outnumbered
+            enemy_armed = any("laser" in (m.get("weapons") or []) or "mortar" in (m.get("weapons") or [])
+                              for m in mechs if math.hypot(m["pos"][0] - x, m["pos"][1] - y) < 200.0)
+            outgunned = not has_secondary and enemy_armed
+            if hp_frac < 0.5 and nearest is not None:
+                ehp_frac = nearest.get("hp", 1400) / max(nearest.get("max_hp", 1400), 1)
+                if ehp_frac > hp_frac * 0.7 or taking_fire or crowd >= 2:
                     retreat = True
+            elif hp_frac < 0.35 and nearest is not None:
+                retreat = True
+            elif crowd >= 3 and hp_frac < 0.7:
+                retreat = True
+            elif outgunned and hp_frac < 0.75 and taking_fire:
+                retreat = True  # gun-only vs laser is a losing fight at any HP level
         else:
             self.target_id = None
 
@@ -1003,15 +1082,18 @@ class Bot:
             vx, vy = unit(ax + gx * 0.7, ay + gy * 0.7)
             vx, vy = self.adjust_dir(x, y, vx, vy, 9.0)
             move = (vx, vy)
-            want_boost = energy > 25
+            want_boost = energy > 15  # boost harder during retreat
         elif target is not None:
             mode = "fight"
             tx, ty = target["pos"][0], target["pos"][1]
             dist2 = math.hypot(tx - x, ty - y)
             want = self.desired_range(me, target)
             crowd = sum(1 for m in mechs if d3(m["pos"], me["pos"]) < 150.0)
+            # pull back when outnumbered or low HP
+            if crowd >= 2 or hp_frac < 0.7:
+                want = max(want, 110.0)
             if crowd >= 3:
-                want = max(want, 85.0)  # don't walk into a 3-on-1: hold range, let them come
+                want = max(want, 140.0)
             lo, hi = want * 0.75, want * 1.3
             if crowd >= 3:
                 hi = 1e9
@@ -1020,7 +1102,7 @@ class Bot:
                 self.strafe_dir = -self.strafe_dir if self.rng.random() < 0.8 else self.strafe_dir
                 self.strafe_until = t + 0.7 + self.rng.random() * 1.1
             sx, sy = rot(toward[0], toward[1], PI / 2 * self.strafe_dir)
-            if dist2 > 130.0 and crowd < 3:
+            if dist2 > want * 0.8 and crowd < 3:
                 st = self.steer(obs, (tx, ty), stop=hi)
                 move = st if st else (sx, sy)
                 want_boost = energy > 60
@@ -1063,12 +1145,42 @@ class Bot:
             mode = "zone"
             move = self.steer(obs, zgoal, stop=3.0)
             want_boost = energy > 60 and zurgent
+        elif obs["alive"] <= 4 and zinside and hp_frac > 0.5:
+            # Final stand: hold zone center, let last enemies come to us
+            mode = "final_stand"
+            cx, cy = zinfo[0], zinfo[1]
+            dist_to_center = math.hypot(x - cx, y - cy)
+            if dist_to_center < 12.0:
+                patrol_yaw = t * 0.3
+                move = (math.cos(patrol_yaw) * 0.3, math.sin(patrol_yaw) * 0.3)
+            else:
+                move = self.steer(obs, (cx, cy), stop=10.0) or (0.0, 0.0)
         elif hp_frac < 0.85 or (t - self.last_damage_t) < 6.0:
             mode = "heal"
-            move = (0.0, 0.0)
+            enemy_recent = (t - self.last_enemy_seen_t) < 12.0 or (t - self.last_damage_t) < 8.0
+            if enemy_recent:
+                # Keep moving away from last known threat — don't be a stationary laser target
+                heal_yaw = self.last_damage_bearing if (self.last_damage_bearing is not None and t - self.last_damage_t < 10.0) else me["aim"][0]
+                ax, ay = -math.cos(heal_yaw), -math.sin(heal_yaw)  # away from threat
+                # blend with zone center direction
+                gx, gy = unit(zgoal[0] - x, zgoal[1] - y) if not zinside else (0.0, 0.0)
+                ax, ay = unit(ax * 0.7 + gx * 0.5, ay * 0.7 + gy * 0.5)
+                ax, ay = self.adjust_dir(x, y, ax, ay, 8.0)
+                move = (ax, ay)
+                want_boost = energy > 35 and hp_frac < 0.6
+            else:
+                # Safe to regen in place — but still strafe gently
+                sx, sy = rot(math.cos(me["aim"][0]), math.sin(me["aim"][0]), PI / 2 * self.strafe_dir)
+                sx, sy = self.adjust_dir(x, y, sx, sy, 7.0)
+                move = (sx, sy)
+                want_boost = False
         else:
             mode = "hold"
-            move = (0.0, 0.0)
+            # Even in "hold", keep a slow patrol circle so we're never stationary
+            patrol_yaw = t * 0.4  # slow rotation
+            sx, sy = math.cos(patrol_yaw), math.sin(patrol_yaw)
+            sx, sy = self.adjust_dir(x, y, sx, sy, 5.0)
+            move = (sx * 0.5, sy * 0.5)
 
         # standing on a supply drop: stay inside the ring until we bank it
         for dr in obs.get("drops", []):
@@ -1080,7 +1192,7 @@ class Bot:
                     mode = "capture"
 
         # ---- projectile dodging (only things actually on course for us)
-        if move is not None and mode in ("fight", "retreat", "loot:crate", "loot:npc", "idle", "hold", "heal", "loot:cube", "loot:pickup", "zone") \
+        if move is not None and mode in ("fight", "retreat", "loot:crate", "loot:npc", "idle", "hold", "heal", "loot:cube", "loot:pickup", "zone", "final_stand") \
                 and obs.get("projectiles"):
             dvx, dvy, hit = 0.0, 0.0, False
             for pr in obs["projectiles"]:
@@ -1139,9 +1251,116 @@ class Bot:
         act["move"] = [float(move[0]), float(move[1])]
         act["boost"] = bool(want_boost and energy > 8)
         self.mode = mode
+
+        # ---- telemetry: rolling HP history + periodic status line
+        self._hp_hist.append((t, hp))
+        while self._hp_hist and t - self._hp_hist[0][0] > 6.0:
+            self._hp_hist.pop(0)
+        if fire[0] or fire[1]:
+            self._hits_fired += 1
+        if t - self._tlog_t >= 2.0:
+            self._tlog_t = t
+            sec_kind = (me["weapons"][1]["kind"] if me["weapons"][1] else "none")
+            nd_str = f"{nd:.0f}" if nd < 999 else "none"
+            mf.log(f"STATUS t={t:.1f} alive={obs['alive']} hp={hp:.0f}/{maxhp:.0f} "
+                   f"mode={mode} pos=({x:.0f},{y:.0f}) nrst={nd_str} "
+                   f"sec={sec_kind} cubes={me['cubes']} kills={self._kill_count}")
+
         mf.draw.label(f"{mode} hp{hp:.0f} e{energy:.0f} {info}")
         return act
 
+    def on_end(self, end_msg):
+        place = end_msg["place"] if end_msg else "?"
+        kills = end_msg["kills"] if end_msg else self._kill_count
+        # HP trajectory over last 6s
+        hp_traj = " ".join(f"{h:.0f}@{tt:.1f}" for tt, h in self._hp_hist[-8:])
+        # death cause: last damage weapon
+        last_wpn = max(self._dmg_by_weapon, key=self._dmg_by_weapon.get) if self._dmg_by_weapon else "none"
+        mf.log(f"END place={place} kills={kills} mode={self.mode} "
+               f"total_dmg_taken={self._total_dmg_taken:.0f} "
+               f"dmg_by={self._dmg_by_weapon} "
+               f"hit_rate={self._hits_landed}/{self._hits_fired} "
+               f"hp_last6s=[{hp_traj}] "
+               f"dominant_killer={last_wpn}")
+
 
 if __name__ == "__main__":
-    mf.run(Bot)
+    import sys, json as _json, queue as _queue, threading as _threading, traceback as _traceback
+
+    # Custom run loop that calls bot.on_end() for death summary telemetry
+    def run_with_end(make_bot):
+        q = _queue.Queue()
+        def _reader(q):
+            for line in sys.stdin:
+                if line.strip():
+                    q.put(line)
+            q.put(None)
+        _threading.Thread(target=_reader, args=(q,), daemon=True).start()
+        bot = None
+        last = {}
+        errors = 0
+        while True:
+            batch = [q.get()]
+            while True:
+                try:
+                    batch.append(q.get_nowait())
+                except _queue.Empty:
+                    break
+            latest = None
+            for raw in batch:
+                if raw is None:
+                    if bot and hasattr(bot, "on_end"):
+                        try:
+                            bot.on_end(None)
+                        except Exception:
+                            pass
+                    return
+                try:
+                    msg = _json.loads(raw)
+                except ValueError:
+                    continue
+                kind = msg.get("type")
+                if kind == "hello":
+                    mf.draw.caps = msg.get("config", {}).get("debug", {})
+                    try:
+                        bot = make_bot(msg)
+                    except Exception:
+                        mf.log(_traceback.format_exc())
+                    name = getattr(bot, "name", None) or getattr(make_bot, "__name__", "bot")
+                    sys.stdout.write(_json.dumps({"type": "ready", "name": str(name)[:32]}, separators=(",", ":")) + "\n")
+                    sys.stdout.flush()
+                elif kind == "obs":
+                    latest = msg
+                elif kind == "end":
+                    if bot and hasattr(bot, "on_end"):
+                        try:
+                            bot.on_end(msg)
+                        except Exception:
+                            pass
+                    return
+            if latest is None:
+                continue
+            action = {}
+            mf.draw.clear()
+            if bot is not None:
+                try:
+                    action = dict(bot.act(latest) or {})
+                    last = {k: action[k] for k in ("move", "aim", "boost") if k in action}
+                except Exception:
+                    errors += 1
+                    if errors <= 5 or errors % 100 == 0:
+                        mf.log(f"act() failed at tick {latest['tick']} ({errors} so far):\n{_traceback.format_exc()}")
+                    action = dict(last)
+            action["tick"] = latest["tick"]
+            d = mf.draw.take()
+            if d and "debug" not in action:
+                action["debug"] = d
+            try:
+                sys.stdout.write(_json.dumps(action, separators=(",", ":")) + "\n")
+                sys.stdout.flush()
+            except (TypeError, ValueError):
+                mf.log(f"unserializable action at tick {latest['tick']}:\n{_traceback.format_exc()}")
+                sys.stdout.write(_json.dumps({"tick": latest["tick"], **last}, separators=(",", ":")) + "\n")
+                sys.stdout.flush()
+
+    run_with_end(Bot)
